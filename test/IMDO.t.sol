@@ -50,6 +50,8 @@ interface Vm {
     function recordLogs() external;
     function getRecordedLogs() external returns (Log[] memory);
     function label(address, string calldata) external;
+    function envOr(string calldata, uint256) external view returns (uint256);
+    function envOr(string calldata, address) external view returns (address);
 }
 
 /// @dev The v4 PoolManager surface the suite drives, with the hook's ABI-equivalent tuples.
@@ -942,6 +944,145 @@ contract IMDOHookTest is IMDOFixture {
         _assertReserveReconciles();
     }
 
+    // ----- per-leg bound: a leg is never billed more than its own size -----
+    // A dust leg that crosses a bracket owes a catch-up on everything sold before it. The revised
+    // hook caps that leg at its own output (exact input) or its own input (exact output), so the
+    // swapper's ETH delta for a sell leg is never negative, and carries the rest to the next leg.
+
+    function test_dustCrossingLegIsBoundedToItsOwnOutputAndTheNextLegPaysTheRest() public {
+        uint256 reserve = hook.reserveSnapshot();
+        uint256 t1 = _ceilPct(reserve, 100);
+        Action[] memory legs = new Action[](3);
+        legs[0] = Action(0, 0, -int256(t1 - 1), 0); // just under 1%: free so far
+        legs[1] = Action(0, 0, -int256(uint256(1e12)), 0); // dust crosses into the 0.5% bracket
+        legs[2] = Action(0, 0, -int256(t1), 0); // ordinary leg, cumulative still under 3%
+        int256[] memory m = _execute(bob, mirror, legs, 0);
+        uint256 treasuryBefore = TREASURY.balance;
+        vm.recordLogs();
+        int256[] memory h = _execute(alice, key, legs, 0);
+        (uint256 ethFee, uint256 tokenFee, uint24 maxRate) = _feesInLogs(vm.getRecordedLogs());
+        uint256 g1 = uint256(V4.amount0(m[0]));
+        uint256 g2 = uint256(V4.amount0(m[1]));
+        uint256 g3 = uint256(V4.amount0(m[2]));
+        eq(uint256(hook.feeRate(2 * t1 - 1 + 1e12, reserve)), 5_000, "the whole batch sits in the 0.5% bracket");
+        gt((g1 + g2) * 5_000 / PPM, g2, "the catch-up bill exceeds the dust leg's entire output");
+        eq(h[0], m[0], "leg 1 untouched");
+        eq(V4.amount0(h[1]), 0, "leg 2 surrenders exactly its own output: the ETH leg is never negative");
+        eq(V4.amount1(h[1]), V4.amount1(m[1]), "leg 2 token input unchanged");
+        uint256 total = (g1 + g2 + g3) * 5_000 / PPM;
+        eq(g3 - uint256(V4.amount0(h[2])), total - g2, "leg 3 pays the carried remainder plus its own share");
+        eq(ethFee, total, "the cumulative bill is fully collected by the end of the transaction");
+        eq(tokenFee, 0, "no token-side fee on exact-input legs");
+        eq(uint256(maxRate), 5_000, "rate");
+        eq(TREASURY.balance - treasuryBefore, total, "treasury receives the whole bill in ETH");
+        _assertNoRawCustody();
+    }
+
+    function test_dustCrossingLegAsTheLastLegLeavesABoundedRemainderThatDoesNotCarryAcrossTransactions() public {
+        uint256 reserve = hook.reserveSnapshot();
+        uint256 t1 = _ceilPct(reserve, 100);
+        Action[] memory legs = new Action[](2);
+        legs[0] = Action(0, 0, -int256(t1 - 1), 0);
+        legs[1] = Action(0, 0, -int256(uint256(1e12)), 0);
+        int256[] memory m = _execute(bob, mirror, legs, 0);
+        uint256 treasuryBefore = TREASURY.balance;
+        int256[] memory h = _execute(alice, key, legs, 0);
+        uint256 g1 = uint256(V4.amount0(m[0]));
+        uint256 g2 = uint256(V4.amount0(m[1]));
+        eq(h[0], m[0], "leg 1 untouched");
+        eq(V4.amount0(h[1]), 0, "the last dust leg pays its whole output and nothing more");
+        eq(TREASURY.balance - treasuryBefore, g2, "treasury got exactly that output");
+        gt((g1 + g2) * 5_000 / PPM - g2, 0, "part of the catch-up stays uncollected: the documented trade-off");
+        // Not cheaper than separate transactions: alone, each of the two sells pays nothing at all.
+        (, uint256 feeA) = _sellExactInBoth(t1 - 1);
+        (, uint256 feeB) = _sellExactInBoth(1e12);
+        eq(feeA + feeB, 0, "standalone legs are free");
+        // The remainder is transaction-local: a later transaction of the same origin starts clean.
+        (, uint256 feeC) = _sellExactInBoth(t1 - 1);
+        eq(feeC, 0, "a new transaction starts with an empty bill");
+        _assertNoRawCustody();
+    }
+
+    function test_exactOutputDustCrossingLegIsBoundedToItsOwnInputAndTheNextLegPaysTheRest() public {
+        uint256 reserve = hook.reserveSnapshot();
+        uint256 t1 = _ceilPct(reserve, 100);
+        Action[] memory legs = new Action[](3);
+        legs[0] = Action(0, 0, -int256(t1 - 1), 0); // exact input, just under 1%
+        legs[1] = Action(0, 0, int256(uint256(1e9)), 0); // exact output of 1 gwei crosses into 0.5%
+        legs[2] = Action(0, 0, int256(reserve / 1000), 0); // exact output, ordinary size
+        int256[] memory m = _execute(bob, mirror, legs, 0);
+        uint256 supplyBefore = token.totalSupply();
+        uint256 treasuryBefore = TREASURY.balance;
+        int256[] memory h = _execute(alice, key, legs, 0);
+        eq(
+            uint256(hook.feeRate(uint256(-(V4.amount1(m[0]) + V4.amount1(m[1]) + V4.amount1(m[2]))), reserve)),
+            5_000,
+            "the whole batch sits in the 0.5% bracket"
+        );
+        eq(h[0], m[0], "leg 1 untouched");
+        (uint256 fee2, uint256 fee3) = _assertBoundedExactOutputLegs(m, h);
+        eq(supplyBefore - token.totalSupply(), fee2 + fee3, "both token fees burned");
+        eq(TREASURY.balance, treasuryBefore, "exact-output legs send no ETH");
+        _assertNoRawCustody();
+        _assertReserveReconciles();
+    }
+
+    /// @dev Legs 2 and 3 of the exact-output dust scenario: mirror deltas `m`, hooked deltas `h`.
+    function _assertBoundedExactOutputLegs(int256[] memory m, int256[] memory h)
+        internal
+        pure
+        returns (uint256 fee2, uint256 fee3)
+    {
+        uint256 g1 = uint256(V4.amount0(m[0]));
+        uint256 g2 = uint256(V4.amount0(m[1]));
+        uint256 g3 = uint256(V4.amount0(m[2]));
+        uint256 in2 = uint256(-V4.amount1(m[1]));
+        uint256 in3 = uint256(-V4.amount1(m[2]));
+        eq(g2, 1e9, "leg 2 output as requested");
+        gt((g1 + g2) * 5_000 * in2 / (g2 * PPM), in2, "an unbounded catch-up would exceed the leg's own input");
+        eq(V4.amount0(h[1]), int256(g2), "leg 2 delivers the requested ETH");
+        fee2 = uint256(-V4.amount1(h[1])) - in2;
+        eq(fee2, in2, "leg 2 fee is bounded to its own token input");
+        // The bounded fee is credited at the leg's exchange ratio, exactly g2 * PPM, so leg 3 owes the rest.
+        fee3 = ((g1 + g2 + g3) * 5_000 - g2 * PPM) * in3 / (g3 * PPM);
+        le(fee3, in3, "leg 3 fee within its own input");
+        eq(V4.amount0(h[2]), int256(g3), "leg 3 delivers the requested ETH");
+        eq(uint256(-V4.amount1(h[2])) - in3, fee3, "leg 3 pays the remainder converted at its own price");
+    }
+
+    /// forge-config: default.fuzz.runs = 96
+    function testFuzz_oneTransactionSplitNeverPaysLessThanPerLegBracketsNorMoreThanTheFinalBracket(
+        uint256 a,
+        uint256 b,
+        uint256 c
+    ) public {
+        uint256 reserve = hook.reserveSnapshot();
+        uint256[3] memory sizes = [bound(a, 1, reserve / 40), bound(b, 1, reserve / 40), bound(c, 1, reserve / 40)];
+        Action[] memory legs = new Action[](3);
+        for (uint256 i; i < 3; ++i) {
+            legs[i] = Action(0, 0, -int256(sizes[i]), 0);
+        }
+        int256[] memory m = _execute(bob, mirror, legs, 0);
+        uint256 treasuryBefore = TREASURY.balance;
+        int256[] memory h = _execute(alice, key, legs, 0);
+        uint256 gross;
+        uint256 paid;
+        uint256 perLeg;
+        for (uint256 i; i < 3; ++i) {
+            ok(V4.amount0(h[i]) >= 0, "a sell leg never ends with a negative ETH delta");
+            eq(V4.amount1(h[i]), V4.amount1(m[i]), "token input settled as requested");
+            uint256 g = uint256(V4.amount0(m[i]));
+            gross += g;
+            paid += g - uint256(V4.amount0(h[i]));
+            perLeg += g * hook.feeRate(sizes[i], reserve) / PPM;
+        }
+        uint256 finalRate = hook.feeRate(sizes[0] + sizes[1] + sizes[2], reserve);
+        ok(paid >= perLeg, "splitting inside one transaction never beats billing each leg at its own bracket");
+        le(paid, gross * finalRate / PPM, "never more than the final bracket on all proceeds");
+        eq(TREASURY.balance - treasuryBefore, paid, "treasury");
+        _assertNoRawCustody();
+    }
+
     // ----- reserve snapshot -----
 
     function test_sameTransactionLiquidityInflationDoesNotLowerTheBracket() public {
@@ -1372,6 +1513,10 @@ contract IMDOTokenTest is Asserts {
 // exercised only through their guard paths; see .imd-findings.json for the offline-simulation gap.)
 // ---------------------------------------------------------------------------------------------
 contract IMDODeployScriptTest is IMDOFixture {
+    bytes32 constant TRANSFER_TOPIC = keccak256("Transfer(address,address,uint256)");
+    bytes32 constant ATTESTED_TOPIC = keccak256(
+        "LaunchAttested(uint256,address,address,address,bytes32,uint160,address,uint256,uint24,bytes32,bytes32)"
+    );
     Deploy deploy;
 
     function setUp() public {
@@ -1379,16 +1524,37 @@ contract IMDODeployScriptTest is IMDOFixture {
         deploy = new Deploy();
     }
 
+    /// @dev The script reads exactly two variables, both optional on the local chain. The suite sets
+    /// none (vm.setEnv is shared by every parallel test), so it reads what the run provides and only
+    /// expects a local deployment when that configuration permits one.
+    function _environmentPermitsALocalRun() internal view returns (bool) {
+        uint256 expected = vm.envOr("EXPECTED_CHAIN_ID", uint256(0));
+        address configured = vm.envOr("POOL_MANAGER", address(0));
+        return (expected == 0 || expected == block.chainid) && configured == address(0);
+    }
+
     function test_constantsAgreeWithTheHook() public view {
         eq(deploy.CHAIN_ID(), 11_155_111, "Sepolia");
+        eq(deploy.LOCAL_CHAIN_ID(), 31_337, "local dry run");
+        eq(deploy.CREATE2_DEPLOYER(), 0x4e59b44847b379578588920cA78FbF26c0B4956C, "Foundry's deterministic deployer");
         eq(deploy.TREASURY(), hook.TREASURY(), "treasury");
         eq(uint256(deploy.HOOK_FLAGS()), uint256(hook.FLAGS()), "flags");
         eq(uint256(deploy.ALL_HOOK_FLAGS()), 0x3fff, "mask");
+        ok(deploy.IS_SCRIPT(), "marked as tooling");
+    }
+
+    function test_hookCreationCodeIsTheFactorysInitCode() public view {
+        bytes memory expected =
+            abi.encodePacked(type(IMDOFeeHook).creationCode, abi.encode(address(manager), address(token)));
+        eq(
+            keccak256(deploy.hookCreationCode(address(manager), address(token))),
+            keccak256(expected),
+            "creation code ++ abi.encode(manager, token)"
+        );
     }
 
     function test_mineReproducesTheFactoryDeployment() public view {
-        bytes32 initHash =
-            keccak256(abi.encodePacked(type(IMDOFeeHook).creationCode, abi.encode(address(manager), address(token))));
+        bytes32 initHash = keccak256(deploy.hookCreationCode(address(manager), address(token)));
         (bytes32 salt, address predicted) = deploy.mine(address(factory), initHash, 0);
         eq(salt, factory.hookSalt(), "same salt as the factory found");
         eq(predicted, address(hook), "predicted address is the deployed hook");
@@ -1402,10 +1568,111 @@ contract IMDODeployScriptTest is IMDOFixture {
         eq(uint256(uint160(predicted) & 0x3fff), 0x25d4, "flag bits");
     }
 
-    function test_runRefusesTheWrongChain() public {
-        ok(block.chainid != 11_155_111, "test chain");
+    /// @dev The network's offline check: the script runs on the bare local chain with no
+    /// configuration, deploys the stand-in manager, the token and the hook, and attests them.
+    function test_runOnTheLocalChainDeploysTheTokenAndTheMinedHookAndAttests() public {
+        eq(block.chainid, deploy.LOCAL_CHAIN_ID(), "the test chain is the local dry-run chain");
+        if (!_environmentPermitsALocalRun()) {
+            // A foreign EXPECTED_CHAIN_ID or a code-less POOL_MANAGER in the environment: refused.
+            vm.expectRevert(Deploy.InvalidConfiguration.selector);
+            deploy.run();
+            return;
+        }
+        vm.recordLogs();
+        (IMDOToken t, IMDOFeeHook h, bytes32 salt) = deploy.run();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        // Token: the fixed supply, minted once, all of it to the single broadcasting account.
+        eq(t.totalSupply(), INITIAL_SUPPLY, "fixed supply");
+        address holder = _mintRecipient(logs, address(t));
+        ok(holder != address(0), "a mint was recorded");
+        eq(t.balanceOf(holder), INITIAL_SUPPLY, "the whole supply went to the deploying account");
+        eq(keccak256(bytes(t.symbol())), keccak256("IMDO"), "symbol");
+
+        // Hook: mined address, bound to this token and to a code-only stand-in manager, no pool yet.
+        eq(uint256(uint160(address(h)) & 0x3fff), 0x25d4, "hook address carries exactly the permission bits");
+        eq(h.token(), address(t), "hook bound to the deployed token");
+        address standIn = address(h.poolManager());
+        ok(standIn.code.length != 0, "stand-in manager has code");
+        ok(standIn != address(manager), "the stand-in is not the real manager");
+        ok(!h.initialized(), "no pool bound: the launch factory initializes it");
+        eq(h.TREASURY(), TREASURY, "treasury");
+        eq(uint256(h.MAX_FEE_PPM()), 20_000, "cap");
+
+        // The salt is the one mine() finds for Foundry's CREATE2 deployer and the exact init code.
+        (bytes32 s, address predicted) =
+            deploy.mine(deploy.CREATE2_DEPLOYER(), keccak256(deploy.hookCreationCode(standIn, address(t))), 0);
+        eq(s, salt, "returned salt is the mined salt");
+        eq(predicted, address(h), "hook deployed through the CREATE2 deployer at the predicted address");
+
+        _assertAttested(logs, t, h, standIn, salt);
+
+        // The local artefact is inert: the real manager cannot initialize a pool against a hook
+        // whose manager is the stand-in, because the callback refuses any other caller.
+        IMDPoolKey memory k = IMDPoolKey(address(0), address(t), 3000, 60, address(h));
+        vm.expectRevert();
+        manager.initialize(k, V4.SQRT_1_1);
+        ok(!h.initialized(), "still unbound");
+    }
+
+    /// forge-config: default.fuzz.runs = 64
+    function testFuzz_runRefusesEveryChainButLocalAndSepolia(uint64 chainId) public {
+        chainId = uint64(bound(chainId, 1, type(uint64).max));
+        vm.assume(chainId != 31_337 && chainId != 11_155_111);
+        vm.chainId(chainId);
         vm.expectRevert(Deploy.InvalidConfiguration.selector);
         deploy.run();
+    }
+
+    function test_runOnSepoliaWithoutAConfiguredPoolManagerIsRefused() public {
+        vm.chainId(deploy.CHAIN_ID());
+        // POOL_MANAGER is unset, or names an address that has no code in this EVM: both are refused
+        // before anything is deployed. The stand-in is never an option on the target chain.
+        vm.expectRevert(Deploy.InvalidConfiguration.selector);
+        deploy.run();
+    }
+
+    function _mintRecipient(Vm.Log[] memory logs, address t) internal pure returns (address) {
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter != t || logs[i].topics.length != 3 || logs[i].topics[0] != TRANSFER_TOPIC) continue;
+            if (logs[i].topics[1] != bytes32(0)) continue;
+            return address(uint160(uint256(logs[i].topics[2])));
+        }
+        return address(0);
+    }
+
+    function _assertAttested(Vm.Log[] memory logs, IMDOToken t, IMDOFeeHook h, address standIn, bytes32 salt)
+        internal
+        view
+    {
+        bool found;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter != address(deploy) || logs[i].topics[0] != ATTESTED_TOPIC) continue;
+            ok(!found, "attested once");
+            found = true;
+            eq(uint256(logs[i].topics[1]), block.chainid, "attested chain id");
+            eq(address(uint160(uint256(logs[i].topics[2]))), address(t), "attested token");
+            eq(address(uint160(uint256(logs[i].topics[3]))), address(h), "attested hook");
+            (
+                address pm,
+                bytes32 attestedSalt,
+                uint160 flags,
+                address treasury,
+                uint256 supply,
+                uint24 maxFee,
+                bytes32 tokenHash,
+                bytes32 hookHash
+            ) = abi.decode(logs[i].data, (address, bytes32, uint160, address, uint256, uint24, bytes32, bytes32));
+            eq(pm, standIn, "attested manager");
+            eq(attestedSalt, salt, "attested salt");
+            eq(uint256(flags), 0x25d4, "attested flags");
+            eq(treasury, TREASURY, "attested treasury");
+            eq(supply, INITIAL_SUPPLY, "attested supply");
+            eq(uint256(maxFee), 20_000, "attested cap");
+            eq(tokenHash, keccak256(type(IMDOToken).creationCode), "attested token creation code");
+            eq(hookHash, keccak256(type(IMDOFeeHook).creationCode), "attested hook creation code");
+        }
+        ok(found, "LaunchAttested emitted");
     }
 
     function test_hookRefusesAnAddressWithoutTheFlags() public {
@@ -1450,8 +1717,13 @@ contract IMDOHandler is Asserts {
     function _run(Action memory a, uint256 value) internal returns (int256) {
         Action[] memory list = new Action[](1);
         list[0] = a;
+        return _runList(list, value)[0];
+    }
+
+    /// @dev One transaction with several pool actions; records every hook fee it charged.
+    function _runList(Action[] memory list, uint256 value) internal returns (int256[] memory d) {
         vm.recordLogs();
-        int256 d = router.execute{value: value}(key, list)[0];
+        d = router.execute{value: value}(key, list);
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 i; i < logs.length; ++i) {
             if (logs[i].emitter != address(hook) || logs[i].topics[0] != FEE_TOPIC) continue;
@@ -1462,7 +1734,28 @@ contract IMDOHandler is Asserts {
             else tokenFeesCharged += amount;
         }
         calls++;
-        return d;
+    }
+
+    /// @dev Two sell legs in one transaction, optionally mixing modes: the cumulative-bill and
+    /// per-leg-bound paths. Both legs must leave the swapper a non-negative ETH delta.
+    function splitSell(uint256 first, uint256 second, bool secondExactOut) external {
+        uint256 reserve = hook.liveReserve();
+        first = bound(first, 1, _max(reserve / 100, 1));
+        if (first > token.balanceOf(address(this)) / 4) return;
+        Action[] memory legs = new Action[](2);
+        legs[0] = Action(0, 0, -int256(first), 0);
+        if (secondExactOut) {
+            uint256 poolEth = address(manager).balance - hook.accruedETH();
+            if (poolEth < 1000) return;
+            legs[1] = Action(0, 0, int256(bound(second, 1, poolEth / 20)), 0);
+        } else {
+            second = bound(second, 1, _max(reserve / 100, 1));
+            if (second > token.balanceOf(address(this)) / 4) return;
+            legs[1] = Action(0, 0, -int256(second), 0);
+        }
+        int256[] memory d = _runList(legs, 0);
+        ok(V4.amount0(d[0]) >= 0 && V4.amount0(d[1]) >= 0, "a sell leg never ends with a negative ETH delta");
+        ok(V4.amount1(d[0]) == -int256(first), "first leg settled its exact input");
     }
 
     function sellExactIn(uint256 size) external {
