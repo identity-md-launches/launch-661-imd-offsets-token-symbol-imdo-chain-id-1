@@ -41,13 +41,14 @@ Transient storage groups **all sells by `tx.origin` in one transaction**, across
 
 Batching uses a cumulative bill, including a catch-up charge when crossing a bracket. Let `S` be cumulative settled token input, `Q` cumulative gross ETH output, and `P` the fee already paid, valued in ETH-wei times 1,000,000. For each sell, `r = feeRate(S, laggedReserve)` and `D = Q*r - P`:
 
-- Exact input collects `floor(D / 1_000_000)` ETH and adds that amount times 1,000,000 to `P`.
-- Exact output collects `floor(D * currentTokenInput / (currentETHOutput * 1_000_000))` IMDO and credits its settled exchange-value to `P`, rounded down. Full-width multiplication prevents intermediate overflow. Fractional residuals carry to later legs in the transaction.
-- A dust swap with token input and zero ETH output still adds its token volume. Exact input can settle an earlier catch-up bill; a zero-output exact-output leg cannot convert a quote bill and leaves it for a later leg.
+- Exact input collects `min(floor(D / 1_000_000), currentETHOutput)` ETH and adds that amount times 1,000,000 to `P`.
+- Exact output collects `min(floor(D * currentTokenInput / (currentETHOutput * 1_000_000)), currentTokenInput)` IMDO and credits its settled exchange-value to `P`, rounded down. Full-width multiplication prevents intermediate overflow. Fractional residuals carry to later legs in the transaction.
+- **Per-leg bound:** a leg is never billed more than its own size. The ETH fee never exceeds the leg's gross ETH output and the IMDO fee never exceeds the leg's settled IMDO input. The swapper's ETH delta for a sell is therefore never negative, so routers that take only positive output per leg settle every leg. Whatever part of the cumulative bill a small leg could not carry stays in `D` and is charged on the next sell leg of the same transaction.
+- A dust swap with token input and zero ETH output still adds its token volume and pays nothing itself; its catch-up charge is collected by the next leg that has output.
 
-For batches of exact-input sells, aggregate ETH fees equal the final cumulative gross ETH output times the final bracket, rounded down. Mixed modes settle the same quote-valued bill using each fee-paying leg's actual exchange ratio. Different execution prices and integer rounding can affect the token amount burned.
+For a single sell, the bound never binds: every bracket is at most 2% of the leg. For batches of exact-input sells whose legs are not tiny, aggregate ETH fees equal the final cumulative gross ETH output times the final bracket, rounded down. Mixed modes settle the same quote-valued bill using each fee-paying leg's actual exchange ratio. Different execution prices and integer rounding can affect the token amount burned.
 
-**Router constraint:** full cumulative billing at discontinuous brackets can charge more than a tiny last leg's ETH output. For example, selling just below 1% and then crossing 1% incurs the 0.5% bill on the earlier proceeds too. That last leg can have a negative ETH delta. Routers must settle the aggregate transaction deltas or provide the additional ETH, and include catch-up charges in slippage limits. A router that requires every individual sell to have positive ETH output is not compatible with that batching edge case. The 2% cap bounds the cumulative bracket, not each catch-up leg independently. There is no sell gate, allowlist or administrator; insufficient balances, gas, v4 numeric limits and router slippage constraints can still revert a trade. Full retroactive billing and unconditional compatibility with output-only routers cannot both be promised with an `afterSwap` unspecified-currency delta.
+**Splitting still does not pay.** A transaction that ends on a tiny bracket-crossing leg leaves the remainder of that catch-up uncollected, but it has then paid at least what selling the already-billed earlier legs alone would have cost, and every further leg in that transaction surrenders up to its whole output until the remainder is paid. The bound trades a bounded, tx-local remainder on the last leg for compatibility with output-only routers; the previous behaviour charged the entire catch-up on the crossing leg and could make that leg's ETH delta negative, which routers such as Uniswap's own `PoolSwapTest` reject. There is no sell gate, allowlist or administrator; insufficient balances, gas, v4 numeric limits and router slippage constraints can still revert a trade.
 
 ## Reserve integrity and fee claims
 
@@ -63,7 +64,7 @@ Normal token and ETH user balances never remain in the hook after a supported op
 
 ## Factory and swarm compatibility
 
-The **pool's own LP fee** remains the manifest's static `pool.fee`: **500 ppm (0.05%)**, **3,000 ppm (0.3%)**, or **10,000 ppm (1%)**. The script defaults to **3,000 ppm** and tick spacing **60**. The hook returns zero from liquidity delta callbacks and zero LP fee override from `beforeSwap`. It never modifies, collects, owns or reroutes the factory's liquidity position. The swap's pool math and LP fee growth run unchanged before the hook adds its fee.
+The **pool's own LP fee** remains the manifest's static `pool.fee`: **500 ppm (0.05%)**, **3,000 ppm (0.3%)**, or **10,000 ppm (1%)**. The launch attestation below records **3,000 ppm** and tick spacing **60**; the factory sets them when it initializes the pool, and the hook accepts any of the three tiers. The hook returns zero from liquidity delta callbacks and zero LP fee override from `beforeSwap`. It never modifies, collects, owns or reroutes the factory's liquidity position. The swap's pool math and LP fee growth run unchanged before the hook adds its fee.
 
 **LP fee destination:** PoolManager credits the LP fees to the liquidity positions, including the factory-owned launch position. The factory collects and distributes its position's fees to **its existing configured payout recipients under its existing distribution logic**. If PoolManager protocol fees are enabled, the protocol portion remains under PoolManager's protocol accounting. **Hook fee destination:** treasury ETH for exact-input sells, burned IMDO for exact-output sells, or accrued claims redeemable only to those same destinations. Holding IMDO grants no claim on either fee stream.
 
@@ -83,7 +84,7 @@ The mined low **14** address bits must equal **`0x25d4` (9684)**:
 
 All other permission flags are false, including `beforeSwapReturnDelta` and both liquidity-return-delta permissions. The constructor checks **all** 14 address bits; salt mining cannot omit unwanted bits. Initialization is protected even when a prospective hook address has no deployed code: v4 must successfully invoke the required initialization callback.
 
-Anyone can deploy `IMDOToken`, transfer/approve their tokens, burn their own tokens, call read-only getters, or harvest accrued hook claims. Only PoolManager can drive the enabled callbacks and the guarded harvest callback. There are no other privileged or administrative functions. `feeRate`, `reserveSnapshot` and `getHookPermissions` are publicly readable. The launch script's `prepare`, `mine` and `run` are local tooling, not deployed governance powers.
+Anyone can deploy `IMDOToken`, transfer/approve their tokens, burn their own tokens, call read-only getters, or harvest accrued hook claims. Only PoolManager can drive the enabled callbacks and the guarded harvest callback. There are no other privileged or administrative functions. `feeRate`, `reserveSnapshot` and `getHookPermissions` are publicly readable. The launch script's `run`, `mine` and `hookCreationCode` are local tooling, not deployed governance powers.
 
 The self-contained `BaseHookFee` follows [OpenZeppelin's BaseHookFee pattern](https://github.com/OpenZeppelin/uniswap-hooks/blob/master/src/fee/BaseHookFee.sol): an independent fee on the settled unspecified currency, returned as a positive hook delta, with manager claims available for deferred collection. This is an adaptation, not an import or a claim of inheriting the published library unchanged. It adds fixed economic rules, direct payment/burning, cumulative billing and reserve observation. The local tuples match the [v4 callback ABI](https://github.com/Uniswap/v4-core/blob/main/src/interfaces/IHooks.sol).
 
@@ -99,26 +100,30 @@ forge build --use 0.8.26 --evm-version cancun --optimize --optimizer-runs 200 --
 
 Use these same compiler settings for **every** preparation, simulation and final launch. `--no-metadata` avoids metadata bytes being interpreted as executable opcodes by the pinned floor's whole-bytecode scanner. No build configuration file is created. The source also compiles without optimization.
 
-`script/Deploy.s.sol:Deploy` reads the following configuration from the environment. Its locally declared Foundry cheatcode interface needs no `forge-std` dependency.
+`script/Deploy.s.sol:Deploy` is the reference deployment. It reads **no keys** and only this configuration; its locally declared Foundry cheatcode interface needs no `forge-std` dependency.
 
 | Variable | Meaning / default |
 | --- | --- |
-| `POOL_MANAGER` | Required real PoolManager address; constructor argument, never hardcoded |
-| `LAUNCH_FACTORY` | Required existing factory address |
-| `TOKEN_ADDRESS` | Required factory-predicted token address, before token deployment |
-| `HOOK_CREATE2_DEPLOYER` | Actual CREATE2 deployer; defaults to `LAUNCH_FACTORY` |
-| `POOL_FEE` | One of 500, 3000, 10000; default **3000** |
-| `TICK_SPACING` | Default **60**; valid positive v4 spacing, at most **32767** |
-| `SALT_START` | CREATE2 search start; default **0**, at most **1,000,000 attempts** per search |
-| `FACTORY_CALLDATA` | Existing factory's ABI-encoded atomic launch call; required for `run()` |
-| `LAUNCH_VALUE` | ETH wei forwarded to that call; default **0** |
+| `EXPECTED_CHAIN_ID` | **0** (default) accepts the chain the script runs on; any other value must equal `block.chainid`. The chain itself must be **31337** (local dry run) or **11155111** (Sepolia); every other chain reverts with `InvalidConfiguration()` |
+| `POOL_MANAGER` | The Uniswap v4 PoolManager, passed to the hook's constructor and never hardcoded. **Required on 11155111** and must have code. Optional on 31337: when unset, the script deploys `LocalPoolManagerStandIn`, an empty contract whose only purpose is to satisfy the hook constructor's "manager has code" check in an offline EVM; no pool can be initialized against it |
 
-1. Configure the factory, manager, predicted token and pool values. Run `forge script script/Deploy.s.sol:Deploy --sig 'prepare()'` with the compiler options above. `prepare()` returns token creation code, hook creation code including constructor arguments, mined salt, predicted hook, pool key and pool ID. No deployment occurs.
-2. Use the **existing factory's actual ABI** to encode `FACTORY_CALLDATA` from that returned plan. The factory must create the token itself, CREATE2-deploy the hook through the configured deployer, initialize the pool with the hook attached, and perform its ordinary liquidity allocation and swarm distribution in one transaction. There is no invented replacement factory ABI in this repository.
-3. Run `forge script script/Deploy.s.sol:Deploy --rpc-url "$SEPOLIA_RPC_URL"` with the same compiler options and configured Foundry signing account to simulate `run()`. The script checks chain **11155111**, real manager/factory code, unoccupied predicted addresses, the returned token runtime and fixed supply, the hook's immutable bindings and initialized pool ID. Review the single factory call and its existing payout addresses. Do not use `--skip-simulation`.
-4. The deployer may submit that same simulated factory call using Foundry's `--broadcast` workflow. This assignment did **not** broadcast a transaction or provide a signing key. Script checks after the factory call are simulation checks; the real factory remains responsible for its atomic on-chain launch assertions.
+`run()` performs, between `vm.startBroadcast()` and `vm.stopBroadcast()`:
 
-`LaunchPrepared` and `LaunchAttested` script events expose creation-code hashes, constructor bindings, salt, permission bits, pool ID, fee values and factory calldata hash in the simulation trace. They are not an on-chain attestation registry. Changes to compiler settings, constructor arguments, factory deployer or creation code require a new salt calculation.
+1. `new IMDOToken()` with CREATE. The whole fixed supply goes to the broadcasting account, exactly as it goes to the launch factory when the factory is the constructor caller.
+2. `mine(CREATE2_DEPLOYER, keccak256(hookCreationCode(poolManager, token)), 0)`: a bounded search (at most **1,000,000** salts) for a salt whose CREATE2 address through Foundry's deterministic deployer `0x4e59b44847b379578588920cA78FbF26c0B4956C` has low 14 bits exactly **`0x25d4`**.
+3. `new IMDOFeeHook{salt: salt}(poolManager, token)`. Foundry routes a salted `new` in broadcast mode through that deployer, so the deployed address equals the mined prediction; the script reverts with `InvalidLaunchResult()` otherwise.
+
+On 31337 without `POOL_MANAGER` the stand-in manager is deployed first, inside the same markers, so an anvil broadcast is self-consistent. Nothing else is deployed: no pool, no liquidity, no factory or distributor call. After the markers, `_attest` re-reads the deployed contracts and reverts with `InvalidLaunchResult()` unless the token name, symbol, 18 decimals and **10^27** fixed supply, the hook's manager and token bindings, treasury, **20,000 ppm** cap, permission bits and not-yet-initialized state all match. It then emits `LaunchAttested` (chain ID, token, hook, manager, salt, flags, treasury, supply, cap, creation-code hashes) in the simulation trace. That event is not an on-chain registry.
+
+The network's standard offline check passes on a bare local EVM:
+
+```sh
+EXPECTED_CHAIN_ID=0 forge script script/Deploy.s.sol:Deploy --offline
+```
+
+It deploys the stand-in manager, the token and the hook on chain 31337 and returns `(token, hook, salt)`. `EXPECTED_CHAIN_ID=11155111` on that local EVM, chain 11155111 without `POOL_MANAGER`, or a `POOL_MANAGER` without code each revert with `InvalidConfiguration()` before any deployment.
+
+**Sepolia (operator only).** `POOL_MANAGER=<v4 PoolManager> EXPECTED_CHAIN_ID=11155111 forge script script/Deploy.s.sol:Deploy --rpc-url "$SEPOLIA_RPC_URL" --account <name>` simulates; adding `--broadcast` submits the two deployments. This assignment did **not** broadcast a transaction or provide a signing key. The launch factory then initializes the ETH/IMDO pool with `hooks = <deployed hook>` and one of the fee tiers **500 / 3000 / 10000**; the hook accepts exactly one such initialization in `beforeInitialize` and refuses every other pool. The launch attestation below writes the manager as `$poolManager` and the token as `$token`, the values the network's deployer fills in; a factory that deploys the hook itself must use the same creation code with the same two constructor arguments and a salt mined for the deployer it actually uses. Changing compiler settings, constructor arguments or the deployer changes the salt.
 
 ## Launch attestation
 
@@ -126,8 +131,16 @@ The following is the **source-level launch attestation**, embedded here because 
 
 ```json
 {
-  "status": "source-ready; production factory simulation pending",
+  "status": "source-ready; offline dry run passes on 31337; Sepolia simulation by the operator pending",
   "chainId": 11155111,
+  "deployScript": {
+    "artifact": "script/Deploy.s.sol:Deploy",
+    "configuration": ["EXPECTED_CHAIN_ID", "POOL_MANAGER"],
+    "allowedChainIds": [31337, 11155111],
+    "create2Deployer": "0x4e59b44847b379578588920cA78FbF26c0B4956C",
+    "deploysBetweenBroadcastMarkers": ["IMDOToken (CREATE)", "IMDOFeeHook (CREATE2, mined salt)"],
+    "offlineCheck": "EXPECTED_CHAIN_ID=0 forge script script/Deploy.s.sol:Deploy --offline"
+  },
   "token": {
     "artifact": "src/IMDOFeeHook.sol:IMDOToken",
     "name": "IMD Offsets",
@@ -169,7 +182,8 @@ The following is the **source-level launch attestation**, embedded here because 
   "buildCodeHashes": {
     "tokenCreationCodeKeccak256": "0xce0eec3522bd7a5dd9df05e1bcf4b92f1a0e6958cbb29b14fa2bc6052ca8963d",
     "tokenRuntimeCodeKeccak256": "0xafd4a6163de1dbde9aa5a0070480863f6d1def0ac2685defabcf08ebffddd74e",
-    "hookCreationCodeWithoutArgumentsKeccak256": "0x53b389914fa4835ce68c2ad2c2f8f8f428c96d3f829e2cfdb93e72f5afde4b62"
+    "hookCreationCodeWithoutArgumentsKeccak256": "0x6c8a2865cfa0745678b24c3bf62b9d0568b67f9aa39c5935bc1173e85accd5b6",
+    "hookRuntimeCodeKeccak256": "0xb4ca126f38843e73657785cf1c76bc1f61f3d666663a68981aa750a49ce18b0d"
   },
   "holdersReceivePayouts": false,
   "externalAuditPerformed": false,
@@ -179,22 +193,16 @@ The following is the **source-level launch attestation**, embedded here because 
 
 ## Local verification and limits
 
-**Results:** offline unoptimized `forge build --sizes` passed. The scratch suite passed **27 tests**, including **512 fuzz cases** and **32 invariant runs × 32 calls = 1,024 calls**, with zero invariant reverts. The two supplied protected suites, copied into scratch with only import paths adapted and missing test helpers provided locally, passed **all 9 tests**, with zero skips. Total: **36 passing tests**. The optimized attested hook runtime is **7,340 bytes**, and the token runtime is **1,337 bytes**, below the **24,576-byte** runtime limit. Unoptimized token, hook and script also fit that limit.
+**Results of the first round (accepted code):** the scratch suite passed **27 tests**, including **512 fuzz cases** and **32 invariant runs × 32 calls = 1,024 calls**, with zero invariant reverts, on a real Uniswap v4 PoolManager with actual settlement. It compared equivalent hooked and hookless factory positions for pool fee growth, collection and final recipient balances, and covered both free buy modes, exact-input thresholds and all exact-output fee tiers, exact treasury receipts and burns, batched and mixed-mode cumulative bills, same-transaction reserve inflation, protocol fee accounting, fresh token-only liquidity, rejection-to-claim fallback and harvesting, callback/permission/opcode restrictions, untaxed Merkle claims, ERC-20 allowances, transfers and burning. Stateful checks asserted zero raw hook custody, recorded claims equal to manager claim balances, reconciled pool inventory and non-increasing supply.
 
-The integration command used local test-only sources in scratch:
+**Results of this revision** (changes: deploy script rewritten; per-leg fee bound in `_bill`): offline `forge build`, `forge build --sizes` and `forge fmt --check` pass. `EXPECTED_CHAIN_ID=0 forge script script/Deploy.s.sol:Deploy --offline` succeeds on chain 31337 and the three misconfiguration cases above revert before deploying. The optimized attested hook runtime is **7,378 bytes**, and the token runtime is **1,337 bytes**, below the **24,576-byte** limit. The two supplied protected floor suites, copied into scratch with import paths adapted and the missing `HookFlags`/`MockERC20` helpers provided locally, passed **all 9 tests** against the revised creation code, zero skips. A revision scratch suite of **10 tests** on a real PoolManager passed: free buy; exact single-sell fees at 0 / 5,000 / 10,000 / 20,000 ppm with the snapshot lagged; a half/half split billed cumulatively (unchanged by the bound); a tiny bracket-crossing exact-input leg settled by an output-only batching router with the carried bill collected by the next leg, and left uncollected when it is the last leg; the exact-output analogue with the IMDO fee bounded by the leg's own input; and the deploy script run from a test with no environment, with a real `POOL_MANAGER` followed by a factory-style pool initialization, and rejecting another chain. The same tiny-leg checks run against the accepted code reverted in the router with `negative ETH leg`, which is the reopened finding.
 
 ```sh
-FOUNDRY_INVARIANT_RUNS=32 FOUNDRY_INVARIANT_DEPTH=32 \
-FOUNDRY_INVARIANT_FAIL_ON_REVERT=true \
-FOUNDRY_TEST=test/scratch/checks FOUNDRY_OUT=test/scratch/out \
-FOUNDRY_CACHE_PATH=test/scratch/cache \
-forge test --offline --use 0.8.26 --evm-version cancun \
-  --optimize --via-ir --no-metadata \
-  -R 'forge-std/=test/scratch/deps/forge-std-master/src/' \
-  -R 'v4-core/=test/scratch/deps/v4-core-main/' \
-  -R 'solmate/=test/scratch/deps/solmate/' -vv
+FOUNDRY_OUT=test/scratch/out FOUNDRY_CACHE_PATH=test/scratch/cache \
+forge test --offline --use 0.8.26 --evm-version cancun --optimize --via-ir \
+  --match-path 'test/scratch/**/*.sol' \
+  -R forge-std/=<forge-std>/src/ -R v4-core/=<v4-core>/ \
+  -R solmate/=<v4-core>/lib/solmate/ -R @openzeppelin/=<v4-core>/lib/openzeppelin-contracts/
 ```
 
-Scratch checks use a real Uniswap v4 PoolManager and actual settlement, not mocked swap deltas. They compare equivalent hooked and hookless factory positions for pool fee growth, collection and final recipient balances. Checks cover both free buy modes; exact-input thresholds and all exact-output fee tiers; exact treasury receipts and burns; transaction-batched and mixed-mode cumulative bills; a tiny bracket-crossing leg; same-transaction reserve inflation; protocol fee accounting; fresh token-only liquidity; rejection-to-claim fallback and harvesting; callback/permission/opcode restrictions; untaxed Merkle claims; ERC-20 allowances, transfers and burning; and configuration-driven atomic script execution with a factory harness.
-
-Stateful checks additionally exercise swaps, liquidity changes, block changes and harvesting while asserting zero raw hook custody, recorded claims equal manager claim balances, pool inventory reconciles, and supply never increases. Scratch fixtures and their test-only dependency sources are excluded from delivery as required by the assignment. No live factory fork, independent external audit, formal verification, Slither/Mythril run or Regen retirement was performed. Production factory addresses and calldata were not supplied; their rehearsal remains a deployment prerequisite.
+Scratch fixtures and their test-only dependency sources are excluded from delivery as required by the assignment. No live factory fork, independent external audit, formal verification, Slither/Mythril run or Regen retirement was performed. The production factory's address and launch call were not supplied; its rehearsal against the deployed hook remains a deployment prerequisite.

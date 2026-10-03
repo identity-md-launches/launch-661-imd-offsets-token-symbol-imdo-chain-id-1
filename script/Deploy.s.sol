@@ -1,117 +1,100 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-import {IMDOToken, IMDOFeeHook, IMDPoolKey} from "../src/IMDOFeeHook.sol";
+import {IMDOToken, IMDOFeeHook} from "../src/IMDOFeeHook.sol";
 
 /// @dev Foundry cheatcodes, declared locally so an offline build needs no script dependency.
 interface IMDDeployVm {
-    function envAddress(string calldata name) external view returns (address);
-    function envBytes(string calldata name) external view returns (bytes memory);
     function envOr(string calldata name, address defaultValue) external view returns (address);
     function envOr(string calldata name, uint256 defaultValue) external view returns (uint256);
-    function getCode(string calldata artifactPath) external view returns (bytes memory);
-    function getDeployedCode(string calldata artifactPath) external view returns (bytes memory);
     function startBroadcast() external;
     function stopBroadcast() external;
 }
 
-/// @notice Prepare a factory launch and submit its configured atomic launch call.
-/// @dev The launch factory ABI is deliberately not assumed. Its existing adapter must
-/// encode FACTORY_CALLDATA using prepare()'s bytecode, salt and pool key. The factory
-/// must create IMDOToken itself, deploy the hook with CREATE2, initialize the pool and
-/// execute its normal liquidity/distribution flow in that same call.
+/// @notice Code-only stand-in used ONLY on the local chain (31337) when no POOL_MANAGER is given.
+/// @dev The hook's constructor refuses a manager address without code. A fresh local EVM has no
+/// Uniswap v4 PoolManager, so the offline dry run deploys this empty contract in its place. It
+/// implements nothing, so no pool can ever be initialized against it. It is never deployed on the
+/// target chain: there a real POOL_MANAGER address is mandatory.
+contract LocalPoolManagerStandIn {}
+
+/// @notice Reference deployment of the IMDO token and its immutable sell-fee hook.
+/// @dev Reads no keys. Configuration is the environment variable EXPECTED_CHAIN_ID (0 accepts the
+/// current chain; otherwise it must equal block.chainid) and, on the target chain, POOL_MANAGER.
+/// The chain must be 31337 (local dry run) or 11155111 (Sepolia). Between the broadcast markers the
+/// script deploys IMDOToken with CREATE and IMDOFeeHook with CREATE2 through Foundry's default
+/// deterministic deployer, using a salt mined here so the hook address carries exactly the
+/// permission bits 0x25d4. Pool initialization is NOT part of this script: the launch factory
+/// initializes the ETH/IMDO pool with this hook attached, which the hook accepts exactly once.
 contract Deploy {
+    /// @dev Same marker forge-std's Script carries: tells Foundry this contract is tooling, never deployed.
+    bool public constant IS_SCRIPT = true;
     IMDDeployVm private constant vm = IMDDeployVm(address(uint160(uint256(keccak256("hevm cheat code")))));
+    uint256 public constant LOCAL_CHAIN_ID = 31_337;
     uint256 public constant CHAIN_ID = 11_155_111;
+    /// @dev Foundry routes `new X{salt: s}` through this deployer while broadcasting.
+    address public constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
     uint160 public constant HOOK_FLAGS = 0x25d4;
     uint160 public constant ALL_HOOK_FLAGS = 0x3fff;
     uint256 public constant MINE_ATTEMPTS = 1_000_000;
     address public constant TREASURY = 0xb1eC9d1C36974d05eb9889eBf8A150b05791E559;
 
-    struct LaunchPlan {
-        address poolManager;
-        address factory;
-        address hookCreate2Deployer;
-        address token;
-        address hook;
-        bytes32 hookSalt;
-        bytes tokenCreationCode;
-        bytes hookCreationCode;
-        IMDPoolKey poolKey;
-        bytes32 poolId;
-    }
-
     error InvalidConfiguration();
     error SaltNotFound();
-    error ExistingDeployment();
     error InvalidLaunchResult();
 
-    event LaunchPrepared(
-        address indexed factory,
+    event LaunchAttested(
+        uint256 indexed chainId,
         address indexed token,
         address indexed hook,
         address poolManager,
-        address hookCreate2Deployer,
         bytes32 hookSalt,
-        bytes32 tokenCreationCodeHash,
-        bytes32 hookCreationCodeHash,
-        bytes32 poolId,
-        uint160 hookFlags
-    );
-    event LaunchAttested(
-        uint256 indexed chainId,
-        address indexed factory,
-        bytes32 indexed poolId,
-        address token,
-        address hook,
+        uint160 hookFlags,
         address treasury,
         uint256 initialSupply,
-        uint24 poolFee,
-        int24 tickSpacing,
         uint24 maximumHookFeePpm,
-        bytes32 factoryCalldataHash
+        bytes32 tokenCreationCodeHash,
+        bytes32 hookCreationCodeHash
     );
 
-    /// @notice Build the exact bytecodes, CREATE2 salt and pool key for a factory adapter.
-    /// @dev TOKEN_ADDRESS is the factory's predicted token address; it need not exist yet.
-    function prepare() public view returns (LaunchPlan memory plan) {
-        plan.poolManager = vm.envAddress("POOL_MANAGER");
-        plan.factory = vm.envAddress("LAUNCH_FACTORY");
-        plan.token = vm.envAddress("TOKEN_ADDRESS");
-        plan.hookCreate2Deployer = vm.envOr("HOOK_CREATE2_DEPLOYER", plan.factory);
-        uint256 poolFee = vm.envOr("POOL_FEE", uint256(3_000));
-        uint256 tickSpacing = vm.envOr("TICK_SPACING", uint256(60));
-        if (
-            plan.poolManager == address(0) || plan.factory == address(0) || plan.token == address(0)
-                || plan.hookCreate2Deployer == address(0) || (poolFee != 500 && poolFee != 3_000 && poolFee != 10_000)
-                || tickSpacing == 0 || tickSpacing > 32_767
-        ) revert InvalidConfiguration();
-        // Load this build's local artifacts instead of embedding both contracts in
-        // the script runtime. No network or separately installed library is needed.
-        plan.tokenCreationCode = vm.getCode("src/IMDOFeeHook.sol:IMDOToken");
-        plan.hookCreationCode =
-            abi.encodePacked(vm.getCode("src/IMDOFeeHook.sol:IMDOFeeHook"), abi.encode(plan.poolManager, plan.token));
-        (plan.hookSalt, plan.hook) =
-            mine(plan.hookCreate2Deployer, keccak256(plan.hookCreationCode), vm.envOr("SALT_START", uint256(0)));
-        plan.poolKey = IMDPoolKey({
-            currency0: address(0),
-            currency1: plan.token,
-            fee: uint24(poolFee),
-            tickSpacing: int24(uint24(tickSpacing)),
-            hooks: plan.hook
-        });
-        plan.poolId = keccak256(abi.encode(plan.poolKey));
+    /// @notice Simulate by default; use Foundry's --broadcast only for an approved launch.
+    /// @dev Deploys exactly the token and the hook (plus the local stand-in manager on 31337 only).
+    /// It creates no pool, no liquidity position and touches no factory or distributor.
+    function run() external returns (IMDOToken token, IMDOFeeHook hook, bytes32 salt) {
+        uint256 expected = vm.envOr("EXPECTED_CHAIN_ID", uint256(0));
+        if (block.chainid != LOCAL_CHAIN_ID && block.chainid != CHAIN_ID) revert InvalidConfiguration();
+        if (expected != 0 && expected != block.chainid) revert InvalidConfiguration();
+        address manager = vm.envOr("POOL_MANAGER", address(0));
+        // The real PoolManager is never hardcoded: on the target chain it must be configured.
+        if (manager == address(0) ? block.chainid != LOCAL_CHAIN_ID : manager.code.length == 0) {
+            revert InvalidConfiguration();
+        }
+
+        vm.startBroadcast();
+        if (manager == address(0)) manager = address(new LocalPoolManagerStandIn());
+        token = new IMDOToken();
+        address predicted;
+        (salt, predicted) = mine(CREATE2_DEPLOYER, keccak256(hookCreationCode(manager, address(token))), 0);
+        hook = new IMDOFeeHook{salt: salt}(manager, address(token));
+        vm.stopBroadcast();
+
+        if (address(hook) != predicted) revert InvalidLaunchResult();
+        _attest(token, hook, manager, salt);
+    }
+
+    /// @notice The exact CREATE2 init code of the hook for a manager and token pair.
+    function hookCreationCode(address manager, address launchToken) public pure returns (bytes memory) {
+        return abi.encodePacked(type(IMDOFeeHook).creationCode, abi.encode(manager, launchToken));
     }
 
     /// @notice Find an address whose complete low 14 bits equal the enabled permissions.
-    /// @dev Retry with another SALT_START if this bounded search is exhausted.
+    /// @dev Bounded search; a different start continues it. The salt is only a CREATE2 nonce.
     function mine(address deployer, bytes32 initCodeHash, uint256 start)
         public
         pure
         returns (bytes32 salt, address predicted)
     {
         for (uint256 i; i < MINE_ATTEMPTS; ++i) {
-            // Wrapping the search offset is safe: the salt is only a CREATE2 nonce.
             unchecked {
                 salt = bytes32(start + i);
             }
@@ -122,67 +105,27 @@ contract Deploy {
         revert SaltNotFound();
     }
 
-    /// @notice Simulate by default; use Foundry's --broadcast only for an approved launch.
-    /// @dev This makes exactly one factory call. It does not create an independent LP
-    /// position, change factory payout recipients, or touch the Merkle distributor.
-    function run() external returns (LaunchPlan memory plan) {
-        if (block.chainid != CHAIN_ID) revert InvalidConfiguration();
-        plan = prepare();
-        if (plan.poolManager.code.length == 0 || plan.factory.code.length == 0) revert InvalidConfiguration();
-        if (plan.token.code.length != 0 || plan.hook.code.length != 0) revert ExistingDeployment();
-        bytes memory factoryCalldata = vm.envBytes("FACTORY_CALLDATA");
-        if (factoryCalldata.length < 4) revert InvalidConfiguration();
-        uint256 launchValue = vm.envOr("LAUNCH_VALUE", uint256(0));
-        emit LaunchPrepared(
-            plan.factory,
-            plan.token,
-            plan.hook,
-            plan.poolManager,
-            plan.hookCreate2Deployer,
-            plan.hookSalt,
-            keccak256(plan.tokenCreationCode),
-            keccak256(plan.hookCreationCode),
-            plan.poolId,
-            HOOK_FLAGS
-        );
-        vm.startBroadcast();
-        (bool success, bytes memory result) = plan.factory.call{value: launchValue}(factoryCalldata);
-        vm.stopBroadcast();
-        if (!success) {
-            assembly ("memory-safe") { revert(add(result, 32), mload(result)) }
-        }
-        _attest(plan, keccak256(factoryCalldata));
-    }
-
-    function _attest(LaunchPlan memory plan, bytes32 calldataHash) private {
-        if (
-            plan.token.codehash != keccak256(vm.getDeployedCode("src/IMDOFeeHook.sol:IMDOToken"))
-                || plan.hook.code.length == 0
-        ) {
-            revert InvalidLaunchResult();
-        }
-        IMDOToken token = IMDOToken(plan.token);
-        IMDOFeeHook hook = IMDOFeeHook(plan.hook);
+    function _attest(IMDOToken token, IMDOFeeHook hook, address manager, bytes32 salt) private {
         if (
             token.totalSupply() != token.INITIAL_SUPPLY() || token.INITIAL_SUPPLY() != 1_000_000_000 ether
                 || token.decimals() != 18 || keccak256(bytes(token.name())) != keccak256("IMD Offsets")
-                || keccak256(bytes(token.symbol())) != keccak256("IMDO")
-                || address(hook.poolManager()) != plan.poolManager || hook.token() != plan.token
-                || hook.TREASURY() != TREASURY || hook.MAX_FEE_PPM() != 20_000 || hook.FLAGS() != HOOK_FLAGS
-                || !hook.initialized() || hook.poolId() != plan.poolId
+                || keccak256(bytes(token.symbol())) != keccak256("IMDO") || address(hook.poolManager()) != manager
+                || hook.token() != address(token) || hook.TREASURY() != TREASURY || hook.MAX_FEE_PPM() != 20_000
+                || hook.FLAGS() != HOOK_FLAGS || (uint160(address(hook)) & ALL_HOOK_FLAGS) != HOOK_FLAGS
+                || hook.initialized()
         ) revert InvalidLaunchResult();
         emit LaunchAttested(
-            CHAIN_ID,
-            plan.factory,
-            plan.poolId,
-            plan.token,
-            plan.hook,
+            block.chainid,
+            address(token),
+            address(hook),
+            manager,
+            salt,
+            HOOK_FLAGS,
             TREASURY,
             token.INITIAL_SUPPLY(),
-            plan.poolKey.fee,
-            plan.poolKey.tickSpacing,
             hook.MAX_FEE_PPM(),
-            calldataHash
+            keccak256(type(IMDOToken).creationCode),
+            keccak256(type(IMDOFeeHook).creationCode)
         );
     }
 }

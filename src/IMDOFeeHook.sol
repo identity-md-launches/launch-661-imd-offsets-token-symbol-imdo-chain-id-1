@@ -335,11 +335,19 @@ contract IMDOFeeHook is BaseHookFee {
         rate = feeRate(sold, laggedReserve);
         assert(rate <= MAX_FEE_PPM);
         uint256 due = quote * rate - paid;
+        // Per-leg bound: a leg is never billed more than its own size (ETH fee <= this leg's gross
+        // ETH output, token fee <= this leg's settled token input). The swapper's ETH delta for a
+        // sell therefore never turns negative, so output-only routers can settle every leg. Any
+        // uncollected remainder of the cumulative bill stays in `due` and is charged on the next
+        // sell leg of the same transaction; it can only be left unpaid by stopping, which is never
+        // cheaper than having sold the already-billed cumulative amount alone.
         if (exactInput) {
             fee = due / PPM;
+            if (fee > quoteOut) fee = quoteOut;
             paid += fee * PPM;
         } else if (quoteOut != 0) {
             fee = _mulDiv(due, tokenIn, quoteOut * PPM);
+            if (fee > tokenIn) fee = tokenIn;
             paid += _mulDiv(fee, quoteOut * PPM, tokenIn);
         }
         assembly ("memory-safe") {
