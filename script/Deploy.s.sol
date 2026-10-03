@@ -25,7 +25,10 @@ contract LocalPoolManagerStandIn {}
 /// script deploys IMDOToken with CREATE and IMDOFeeHook with CREATE2 through Foundry's default
 /// deterministic deployer, using a salt mined here so the hook address carries exactly the
 /// permission bits 0x25d4. Pool initialization is NOT part of this script: the launch factory
-/// initializes the ETH/IMDO pool with this hook attached, which the hook accepts exactly once.
+/// initializes the ETH/IMDO pool (fee 3000, tick spacing 60) with this hook attached, which the
+/// hook accepts exactly once. The production launch deploys the hook and initializes that pool in
+/// ONE factory transaction, so nobody can initialize the pinned key at a different price in between;
+/// this two-step script is the offline dry run and the operator's simulation, not that flow.
 contract Deploy {
     /// @dev Same marker forge-std's Script carries: tells Foundry this contract is tooling, never deployed.
     bool public constant IS_SCRIPT = true;
@@ -38,6 +41,9 @@ contract Deploy {
     uint160 public constant ALL_HOOK_FLAGS = 0x3fff;
     uint256 public constant MINE_ATTEMPTS = 1_000_000;
     address public constant TREASURY = 0xb1eC9d1C36974d05eb9889eBf8A150b05791E559;
+    /// @dev The only pool key the hook accepts: ETH/IMDO, manifest fee tier 3000, tick spacing 60.
+    uint24 public constant POOL_FEE = 3_000;
+    int24 public constant TICK_SPACING = 60;
 
     error InvalidConfiguration();
     error SaltNotFound();
@@ -112,7 +118,7 @@ contract Deploy {
                 || keccak256(bytes(token.symbol())) != keccak256("IMDO") || address(hook.poolManager()) != manager
                 || hook.token() != address(token) || hook.TREASURY() != TREASURY || hook.MAX_FEE_PPM() != 20_000
                 || hook.FLAGS() != HOOK_FLAGS || (uint160(address(hook)) & ALL_HOOK_FLAGS) != HOOK_FLAGS
-                || hook.initialized()
+                || hook.POOL_FEE() != POOL_FEE || hook.TICK_SPACING() != TICK_SPACING || hook.initialized()
         ) revert InvalidLaunchResult();
         emit LaunchAttested(
             block.chainid,

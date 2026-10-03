@@ -158,6 +158,9 @@ contract IMDOFeeHook is BaseHookFee {
     uint256 public constant PPM = 1_000_000;
     uint160 public constant FLAGS = 0x25d4;
     uint256 public constant DIRECT_TAKE_GAS = 80_000;
+    /// @dev The launch pool key the factory initializes (manifest `pool.fee` / `pool.tickSpacing`).
+    uint24 public constant POOL_FEE = 3_000;
+    int24 public constant TICK_SPACING = 60;
     address public immutable token;
     bytes32 public poolId;
     bool public initialized;
@@ -204,9 +207,10 @@ contract IMDOFeeHook is BaseHookFee {
         nonReentrant
         returns (bytes4)
     {
+        // The complete launch key is pinned, so no other ETH/IMDO key can bind this hook first.
         if (
             initialized || key.currency0 != address(0) || key.currency1 != token || key.hooks != address(this)
-                || (key.fee != 500 && key.fee != 3_000 && key.fee != 10_000)
+                || key.fee != POOL_FEE || key.tickSpacing != TICK_SPACING
         ) revert InvalidPool();
         initialized = true;
         poolId = keccak256(abi.encode(key));
@@ -335,19 +339,24 @@ contract IMDOFeeHook is BaseHookFee {
         rate = feeRate(sold, laggedReserve);
         assert(rate <= MAX_FEE_PPM);
         uint256 due = quote * rate - paid;
-        // Per-leg bound: a leg is never billed more than its own size (ETH fee <= this leg's gross
-        // ETH output, token fee <= this leg's settled token input). The swapper's ETH delta for a
-        // sell therefore never turns negative, so output-only routers can settle every leg. Any
-        // uncollected remainder of the cumulative bill stays in `due` and is charged on the next
-        // sell leg of the same transaction; it can only be left unpaid by stopping, which is never
-        // cheaper than having sold the already-billed cumulative amount alone.
+        // Per-leg bound: a leg is never billed more than MAX_FEE_PPM of its own size (ETH fee <=
+        // 2% of this leg's gross ETH output, token fee <= 2% of this leg's settled token input).
+        // The swapper's ETH delta for a sell therefore never turns negative, so output-only
+        // routers can settle every leg. Any uncollected remainder of the cumulative bill stays in
+        // `due` and is charged, within the same bound, on the next sell leg of the same transaction.
+        // Hard cap per leg: no leg ever pays more than MAX_FEE_PPM of its own size, even when it
+        // carries the catch-up of earlier legs under the same tx.origin (bundlers, relayers and
+        // batch settlers execute several principals' sells under one origin). For a single sell
+        // this bound never binds, because every bracket is at most MAX_FEE_PPM.
         if (exactInput) {
             fee = due / PPM;
-            if (fee > quoteOut) fee = quoteOut;
+            uint256 legCap = quoteOut * MAX_FEE_PPM / PPM;
+            if (fee > legCap) fee = legCap;
             paid += fee * PPM;
         } else if (quoteOut != 0) {
             fee = _mulDiv(due, tokenIn, quoteOut * PPM);
-            if (fee > tokenIn) fee = tokenIn;
+            uint256 legCap = tokenIn * MAX_FEE_PPM / PPM;
+            if (fee > legCap) fee = legCap;
             paid += _mulDiv(fee, quoteOut * PPM, tokenIn);
         }
         assembly ("memory-safe") {
@@ -368,12 +377,10 @@ contract IMDOFeeHook is BaseHookFee {
             }
             accruedETH += fee;
         } else {
-            // Plain immutable IMDO has no transfer callbacks or privileged burn path.
-            if (IMDOToken(token).balanceOf(address(poolManager)) >= fee) {
-                poolManager.take(token, address(this), fee);
-                IMDOToken(token).burn(fee);
-                return;
-            }
+            // Never move ERC-20 balance out of PoolManager inside afterSwap: a router that synced
+            // the token and transferred its input before the swap settles `balance - reserves`,
+            // so a take here would make it pay the fee twice. The token fee is always an
+            // ERC-6909 claim, burned by harvest() in its own unlock.
             accruedToken += fee;
         }
         poolManager.mint(address(this), uint256(uint160(currency)), fee);
@@ -398,11 +405,14 @@ contract IMDOFeeHook is BaseHookFee {
         uint256 tokenAmount = accruedToken;
         uint256 redeemedETH;
         uint256 redeemedToken;
+        // The ETH leg and the token leg are independent: a treasury that rejects ETH leaves the
+        // ETH claim redeemable later and does not stop the token claim from being burned now.
         if (ethAmount != 0 && address(poolManager).balance >= ethAmount) {
-            accruedETH = 0;
-            poolManager.take{gas: DIRECT_TAKE_GAS}(address(0), TREASURY, ethAmount);
-            poolManager.burn(address(this), 0, ethAmount);
-            redeemedETH = ethAmount;
+            try poolManager.take{gas: DIRECT_TAKE_GAS}(address(0), TREASURY, ethAmount) {
+                accruedETH = 0;
+                poolManager.burn(address(this), 0, ethAmount);
+                redeemedETH = ethAmount;
+            } catch {}
         }
         if (tokenAmount != 0 && IMDOToken(token).balanceOf(address(poolManager)) >= tokenAmount) {
             accruedToken = 0;
