@@ -595,17 +595,57 @@ abstract contract IMDOFixture is Asserts {
     }
 
     /// @dev Same exact-output sell on both pools; returns the settled token input and token fee.
+    /// The token-side fee is never moved inside the swap: it becomes an ERC-6909 claim of the hook
+    /// (`accruedToken`) and is burned by the permissionless harvest(), which the helper then runs.
     function _sellExactOutBoth(uint256 ethOut) internal returns (uint256 tokenIn, uint256 fee) {
         int256 m = _swap(bob, mirror, false, int256(ethOut), 0);
         uint256 treasuryBefore = TREASURY.balance;
         uint256 supplyBefore = token.totalSupply();
+        uint256 claimBefore = hook.accruedToken();
         int256 h = _swap(alice, key, false, int256(ethOut), 0);
         eq(V4.amount0(m), int256(ethOut), "mirror eth out");
         eq(V4.amount0(h), int256(ethOut), "hooked eth out is the requested amount");
         tokenIn = uint256(-V4.amount1(m));
         fee = uint256(-V4.amount1(h)) - tokenIn;
         eq(TREASURY.balance, treasuryBefore, "exact-output sells send no ETH to the treasury");
-        eq(supplyBefore - token.totalSupply(), fee, "token-side fee is burned");
+        eq(token.totalSupply(), supplyBefore, "nothing is burned inside the swap");
+        eq(hook.accruedToken() - claimBefore, fee, "token-side fee is recorded as a claim");
+        _assertNoRawCustody();
+        vm.prank(carol, carol);
+        hook.harvest();
+        eq(hook.accruedToken(), 0, "harvest redeems the whole token claim");
+        eq(supplyBefore - token.totalSupply(), claimBefore + fee, "harvest burns the token-side fee");
+        eq(TREASURY.balance, treasuryBefore, "burning sends nothing to the treasury");
+    }
+
+    /// @dev Reference model of the hook's cumulative bill (README, "Settled fees and transaction
+    /// batching"): bracket on cumulative token input, catch-up on cumulative gross ETH output, and
+    /// every leg bounded to MAX_FEE_PPM of its own size. `b` carries the transaction's counters.
+    struct Bill {
+        uint256 sold;
+        uint256 quote;
+        uint256 paid;
+    }
+
+    function _modelLeg(Bill memory b, uint256 tokenIn, uint256 quoteOut, bool exactInput, uint256 reserve)
+        internal
+        view
+        returns (uint256 fee, uint256 uncapped)
+    {
+        b.sold += tokenIn;
+        b.quote += quoteOut;
+        uint256 due = b.quote * hook.feeRate(b.sold, reserve) - b.paid;
+        if (exactInput) {
+            uncapped = due / PPM;
+            uint256 cap = quoteOut * 20_000 / PPM;
+            fee = uncapped > cap ? cap : uncapped;
+            b.paid += fee * PPM;
+        } else if (quoteOut != 0) {
+            uncapped = due * tokenIn / (quoteOut * PPM);
+            uint256 cap = tokenIn * 20_000 / PPM;
+            fee = uncapped > cap ? cap : uncapped;
+            b.paid += fee * quoteOut * PPM / tokenIn;
+        }
     }
 
     function _feesInLogs(Vm.Log[] memory logs)
@@ -907,21 +947,32 @@ contract IMDOHookTest is IMDOFixture {
         int256[] memory m = _execute(bob, mirror, legs, 0);
         uint256 treasuryBefore = TREASURY.balance;
         int256[] memory h = _execute(alice, key, legs, 0);
-        uint256 gross;
-        uint256 received;
-        for (uint256 i; i < 3; ++i) {
-            gross += uint256(V4.amount0(m[i]));
-            received += uint256(V4.amount0(h[i]));
-        }
+        uint256 g1 = uint256(V4.amount0(m[0]));
+        uint256 g2 = uint256(V4.amount0(m[1]));
+        uint256 g3 = uint256(V4.amount0(m[2]));
+        uint256 fee1 = g1 - uint256(V4.amount0(h[0]));
+        uint256 fee2 = g2 - uint256(V4.amount0(h[1]));
+        uint256 fee3 = g3 - uint256(V4.amount0(h[2]));
+        eq(uint256(hook.feeRate(t1, reserve)), 5_000, "leg 1 bracket");
+        eq(uint256(hook.feeRate(2 * t1, reserve)), 5_000, "leg 2 bracket");
         // cumulative 3 * ceil(1%) >= 3% so the final bracket is 1% on all proceeds
         eq(uint256(hook.feeRate(3 * t1, reserve)), 10_000, "final bracket");
-        eq(gross - received, gross * 10_000 / PPM, "total fee = all proceeds * final rate");
-        eq(TREASURY.balance - treasuryBefore, gross - received, "treasury");
-        le(uint256(V4.amount0(h[0])), uint256(V4.amount0(m[0])), "leg 1 billed at 0.5%");
-        eq(uint256(V4.amount0(m[0])) - uint256(V4.amount0(h[0])), uint256(V4.amount0(m[0])) * 5_000 / PPM, "leg 1");
+        eq(fee1, g1 * 5_000 / PPM, "leg 1 pays 0.5% of its own proceeds");
+        eq(fee2, (g1 + g2) * 5_000 / PPM - fee1, "leg 2 pays the cumulative 0.5% bill less what leg 1 paid");
+        // Leg 3 owes 1% on everything plus the catch-up from 0.5% to 1% on legs 1 and 2. That is more
+        // than 2% of its own proceeds (g1 + g2 > 2 * g3 because each leg lowers the price), so the
+        // per-leg hard cap binds and the shortfall stays uncollected (README: recorded trade-off).
+        uint256 owed3 = (g1 + g2 + g3) * 10_000 / PPM - fee1 - fee2;
+        uint256 cap3 = g3 * 20_000 / PPM;
+        gt(owed3, cap3, "the uncapped catch-up exceeds 2% of leg 3");
+        eq(fee3, cap3, "leg 3 pays exactly the 2% per-leg cap");
+        eq(TREASURY.balance - treasuryBefore, fee1 + fee2 + fee3, "treasury received every leg's fee");
+        gt(fee1 + fee2 + fee3, (g1 + g2 + g3) * 5_000 / PPM, "more than the 0.5% bracket on all proceeds");
+        ok(fee1 + fee2 + fee3 < (g1 + g2 + g3) * 10_000 / PPM, "but less than the final bracket on all proceeds");
+        _assertNoRawCustody();
     }
 
-    function test_mixedModeSplitIsBilledCumulatively() public {
+    function test_mixedModeSplitIsBilledCumulativelyWithinTheLegCap() public {
         uint256 reserve = hook.reserveSnapshot();
         uint256 t1 = _ceilPct(reserve, 100);
         Action[] memory legs = new Action[](2);
@@ -936,18 +987,94 @@ contract IMDOHookTest is IMDOFixture {
         uint256 tokenIn2 = uint256(-V4.amount1(m[1]));
         eq(h[0], m[0], "first leg untouched");
         eq(uint256(hook.feeRate(t1 - 1 + tokenIn2, reserve)), 5_000, "cumulative bracket");
-        uint256 expectedTokens = (g1 + g2) * 5_000 * tokenIn2 / (g2 * PPM);
-        eq(uint256(-V4.amount1(h[1])) - tokenIn2, expectedTokens, "catch-up bill converted into tokens");
-        eq(supplyBefore - token.totalSupply(), expectedTokens, "burned");
+        // The catch-up on leg 1's proceeds, converted at leg 2's price, is ~5.5% of leg 2's input.
+        uint256 uncapped = (g1 + g2) * 5_000 * tokenIn2 / (g2 * PPM);
+        uint256 cap = tokenIn2 * 20_000 / PPM;
+        gt(uncapped, cap, "the converted catch-up exceeds 2% of the exact-output leg");
+        uint256 fee = uint256(-V4.amount1(h[1])) - tokenIn2;
+        eq(fee, cap, "the exact-output leg is billed in tokens, bounded to 2% of its own input");
+        eq(V4.amount0(h[1]), int256(g2), "requested ETH delivered in full");
+        eq(hook.accruedToken(), fee, "token fee recorded as a claim");
+        eq(token.totalSupply(), supplyBefore, "not burned inside the swap");
         eq(TREASURY.balance, treasuryBefore, "no ETH fee on the exact-output leg");
+        vm.prank(carol, carol);
+        hook.harvest();
+        eq(supplyBefore - token.totalSupply(), fee, "harvest burns the token fee");
         _assertNoRawCustody();
         _assertReserveReconciles();
     }
 
-    // ----- per-leg bound: a leg is never billed more than its own size -----
-    // A dust leg that crosses a bracket owes a catch-up on everything sold before it. The revised
-    // hook caps that leg at its own output (exact input) or its own input (exact output), so the
-    // swapper's ETH delta for a sell leg is never negative, and carries the rest to the next leg.
+    function test_mixedModeSplitCatchUpUnderTheCapIsConvertedExactly() public {
+        uint256 reserve = hook.reserveSnapshot();
+        uint256 t1 = _ceilPct(reserve, 100);
+        Action[] memory legs = new Action[](2);
+        legs[0] = Action(0, 0, -int256(t1 / 2), 0); // exact input, 0.5%: free alone
+        legs[1] = Action(0, 0, int256(reserve * 55 / 10_000), 0); // exact output of ~0.55% in tokens
+        int256[] memory m = _execute(bob, mirror, legs, 0);
+        uint256 supplyBefore = token.totalSupply();
+        int256[] memory h = _execute(alice, key, legs, 0);
+        uint256 g1 = uint256(V4.amount0(m[0]));
+        uint256 g2 = uint256(V4.amount0(m[1]));
+        uint256 tokenIn2 = uint256(-V4.amount1(m[1]));
+        eq(h[0], m[0], "first leg untouched");
+        eq(uint256(hook.feeRate(t1 / 2 + tokenIn2, reserve)), 5_000, "together the legs cross 1%");
+        uint256 expected = (g1 + g2) * 5_000 * tokenIn2 / (g2 * PPM);
+        ok(expected < tokenIn2 * 20_000 / PPM, "the catch-up is below the cap, so it is collected in full");
+        gt(expected, tokenIn2 * 5_000 / PPM, "and above the leg's own bracket share");
+        eq(uint256(-V4.amount1(h[1])) - tokenIn2, expected, "0.5% of both legs' ETH, converted at leg 2's price");
+        eq(V4.amount0(h[1]), int256(g2), "requested ETH delivered in full");
+        eq(hook.accruedToken(), expected, "recorded as a claim");
+        vm.prank(carol, carol);
+        hook.harvest();
+        eq(supplyBefore - token.totalSupply(), expected, "burned by harvest");
+        _assertReserveReconciles();
+    }
+
+    // ----- per-leg bound: a leg is never billed more than 2% of its own size -----
+    // A dust leg that crosses a bracket owes a catch-up on everything sold before it. The hook
+    // bounds every leg to MAX_FEE_PPM of its own output (exact input) or its own input (exact
+    // output), so the swapper's ETH delta for a sell leg is never negative, and carries the rest
+    // of the cumulative bill to the next sell leg of the same transaction.
+
+    function test_aLegNeverPaysMoreThanTwoPercentOfItsOwnSizeUnderASharedOrigin() public {
+        // A bundler or batch settler executes two principals' sells under one tx.origin: a 4.9%
+        // sell (1% bracket) followed by a 0.2% sell that pushes the origin into the 2% bracket.
+        uint256 reserve = hook.reserveSnapshot();
+        uint256 big = _ceilPct(reserve, 490);
+        uint256 small = _ceilPct(reserve, 20);
+        Action[] memory legs = new Action[](2);
+        legs[0] = Action(0, 0, -int256(big), 0);
+        legs[1] = Action(0, 0, -int256(small), 0);
+        int256[] memory m = _execute(bob, mirror, legs, 0);
+        int256[] memory h = _execute(alice, key, legs, 0);
+        uint256 g1 = uint256(V4.amount0(m[0]));
+        uint256 g2 = uint256(V4.amount0(m[1]));
+        uint256 fee1 = g1 - uint256(V4.amount0(h[0]));
+        uint256 fee2 = g2 - uint256(V4.amount0(h[1]));
+        eq(uint256(hook.feeRate(big, reserve)), 10_000, "first principal alone: 1%");
+        eq(uint256(hook.feeRate(big + small, reserve)), 20_000, "cumulative: 2%");
+        eq(fee1, g1 * 10_000 / PPM, "leg 1 pays 1%");
+        uint256 owed2 = (g1 + g2) * 20_000 / PPM - fee1;
+        // 1% of leg 1 plus 2% of leg 2 is about 28% of leg 2's own output (README's bundler case).
+        gt(owed2, g2 * 10 * 20_000 / PPM, "the uncapped catch-up is more than ten times the per-leg cap");
+        eq(fee2, g2 * 20_000 / PPM, "the second leg pays 2% of its own output and not a wei more");
+        ok(V4.amount0(h[1]) > 0, "the second principal still receives ETH");
+
+        // Same shape with the second leg in exact-output mode: bounded to 2% of its own token input.
+        legs[1] = Action(0, 0, int256(reserve / 500), 0);
+        m = _execute(bob, mirror, legs, 0);
+        h = _execute(alice, key, legs, 0);
+        uint256 in2 = uint256(-V4.amount1(m[1]));
+        g1 = uint256(V4.amount0(m[0]));
+        g2 = uint256(V4.amount0(m[1]));
+        uint256 tokenFee2 = uint256(-V4.amount1(h[1])) - in2;
+        uint256 uncapped = ((g1 + g2) * 20_000 - (g1 - uint256(V4.amount0(h[0]))) * PPM) * in2 / (g2 * PPM);
+        gt(uncapped, in2 * 20_000 / PPM, "the uncapped catch-up exceeds 2% of the leg's input");
+        eq(tokenFee2, in2 * 20_000 / PPM, "exact-output leg bounded to 2% of its own input");
+        eq(V4.amount0(h[1]), int256(g2), "its requested ETH is delivered in full");
+        eq(hook.accruedToken(), tokenFee2, "token fee is a claim");
+        _assertNoRawCustody();
+    }
 
     function test_dustCrossingLegIsBoundedToItsOwnOutputAndTheNextLegPaysTheRest() public {
         uint256 reserve = hook.reserveSnapshot();
@@ -967,10 +1094,12 @@ contract IMDOHookTest is IMDOFixture {
         eq(uint256(hook.feeRate(2 * t1 - 1 + 1e12, reserve)), 5_000, "the whole batch sits in the 0.5% bracket");
         gt((g1 + g2) * 5_000 / PPM, g2, "the catch-up bill exceeds the dust leg's entire output");
         eq(h[0], m[0], "leg 1 untouched");
-        eq(V4.amount0(h[1]), 0, "leg 2 surrenders exactly its own output: the ETH leg is never negative");
+        uint256 fee2 = g2 * 20_000 / PPM;
+        eq(uint256(V4.amount0(h[1])), g2 - fee2, "leg 2 pays 2% of its own output: the ETH leg is never negative");
         eq(V4.amount1(h[1]), V4.amount1(m[1]), "leg 2 token input unchanged");
         uint256 total = (g1 + g2 + g3) * 5_000 / PPM;
-        eq(g3 - uint256(V4.amount0(h[2])), total - g2, "leg 3 pays the carried remainder plus its own share");
+        ok(total - fee2 <= g3 * 20_000 / PPM, "the carried remainder fits under leg 3's own cap");
+        eq(g3 - uint256(V4.amount0(h[2])), total - fee2, "leg 3 pays the carried remainder plus its own share");
         eq(ethFee, total, "the cumulative bill is fully collected by the end of the transaction");
         eq(tokenFee, 0, "no token-side fee on exact-input legs");
         eq(uint256(maxRate), 5_000, "rate");
@@ -990,9 +1119,10 @@ contract IMDOHookTest is IMDOFixture {
         uint256 g1 = uint256(V4.amount0(m[0]));
         uint256 g2 = uint256(V4.amount0(m[1]));
         eq(h[0], m[0], "leg 1 untouched");
-        eq(V4.amount0(h[1]), 0, "the last dust leg pays its whole output and nothing more");
-        eq(TREASURY.balance - treasuryBefore, g2, "treasury got exactly that output");
-        gt((g1 + g2) * 5_000 / PPM - g2, 0, "part of the catch-up stays uncollected: the documented trade-off");
+        uint256 fee2 = g2 * 20_000 / PPM;
+        eq(uint256(V4.amount0(h[1])), g2 - fee2, "the last dust leg pays 2% of its own output and nothing more");
+        eq(TREASURY.balance - treasuryBefore, fee2, "treasury got exactly that");
+        gt((g1 + g2) * 5_000 / PPM - fee2, 0, "the rest of the catch-up stays uncollected: the documented trade-off");
         // Not cheaper than separate transactions: alone, each of the two sells pays nothing at all.
         (, uint256 feeA) = _sellExactInBoth(t1 - 1);
         (, uint256 feeB) = _sellExactInBoth(1e12);
@@ -1009,7 +1139,7 @@ contract IMDOHookTest is IMDOFixture {
         Action[] memory legs = new Action[](3);
         legs[0] = Action(0, 0, -int256(t1 - 1), 0); // exact input, just under 1%
         legs[1] = Action(0, 0, int256(uint256(1e9)), 0); // exact output of 1 gwei crosses into 0.5%
-        legs[2] = Action(0, 0, int256(reserve / 1000), 0); // exact output, ordinary size
+        legs[2] = Action(0, 0, int256(reserve / 100), 0); // exact output, large enough to carry the rest
         int256[] memory m = _execute(bob, mirror, legs, 0);
         uint256 supplyBefore = token.totalSupply();
         uint256 treasuryBefore = TREASURY.balance;
@@ -1021,8 +1151,13 @@ contract IMDOHookTest is IMDOFixture {
         );
         eq(h[0], m[0], "leg 1 untouched");
         (uint256 fee2, uint256 fee3) = _assertBoundedExactOutputLegs(m, h);
-        eq(supplyBefore - token.totalSupply(), fee2 + fee3, "both token fees burned");
+        eq(hook.accruedToken(), fee2 + fee3, "both token fees are claims");
+        eq(token.totalSupply(), supplyBefore, "nothing burned inside the swap");
         eq(TREASURY.balance, treasuryBefore, "exact-output legs send no ETH");
+        _assertNoRawCustody();
+        vm.prank(carol, carol);
+        hook.harvest();
+        eq(supplyBefore - token.totalSupply(), fee2 + fee3, "harvest burns both token fees");
         _assertNoRawCustody();
         _assertReserveReconciles();
     }
@@ -1042,10 +1177,13 @@ contract IMDOHookTest is IMDOFixture {
         gt((g1 + g2) * 5_000 * in2 / (g2 * PPM), in2, "an unbounded catch-up would exceed the leg's own input");
         eq(V4.amount0(h[1]), int256(g2), "leg 2 delivers the requested ETH");
         fee2 = uint256(-V4.amount1(h[1])) - in2;
-        eq(fee2, in2, "leg 2 fee is bounded to its own token input");
-        // The bounded fee is credited at the leg's exchange ratio, exactly g2 * PPM, so leg 3 owes the rest.
-        fee3 = ((g1 + g2 + g3) * 5_000 - g2 * PPM) * in3 / (g3 * PPM);
-        le(fee3, in3, "leg 3 fee within its own input");
+        eq(fee2, in2 * 20_000 / PPM, "leg 2 fee is bounded to 2% of its own token input");
+        // The bounded fee is credited at leg 2's exchange ratio (floor(fee2 * g2 * PPM / in2)) and
+        // leg 3 owes the rest, converted at its own price; that remainder is under leg 3's cap.
+        uint256 paid2 = fee2 * g2 * PPM / in2;
+        fee3 = ((g1 + g2 + g3) * 5_000 - paid2) * in3 / (g3 * PPM);
+        ok(fee3 < in3 * 20_000 / PPM, "leg 3's share of the bill is below its own cap, so it is collected in full");
+        gt(fee3, in3 * 5_000 / PPM, "and it carries more than leg 3's own bracket share");
         eq(V4.amount0(h[2]), int256(g3), "leg 3 delivers the requested ETH");
         eq(uint256(-V4.amount1(h[2])) - in3, fee3, "leg 3 pays the remainder converted at its own price");
     }
@@ -1065,22 +1203,34 @@ contract IMDOHookTest is IMDOFixture {
         int256[] memory m = _execute(bob, mirror, legs, 0);
         uint256 treasuryBefore = TREASURY.balance;
         int256[] memory h = _execute(alice, key, legs, 0);
-        uint256 gross;
-        uint256 paid;
-        uint256 perLeg;
-        for (uint256 i; i < 3; ++i) {
-            ok(V4.amount0(h[i]) >= 0, "a sell leg never ends with a negative ETH delta");
-            eq(V4.amount1(h[i]), V4.amount1(m[i]), "token input settled as requested");
-            uint256 g = uint256(V4.amount0(m[i]));
-            gross += g;
-            paid += g - uint256(V4.amount0(h[i]));
-            perLeg += g * hook.feeRate(sizes[i], reserve) / PPM;
-        }
+        (uint256 gross, uint256 paid, uint256 perLeg) = _checkExactInputLegs(sizes, m, h, reserve);
         uint256 finalRate = hook.feeRate(sizes[0] + sizes[1] + sizes[2], reserve);
         ok(paid >= perLeg, "splitting inside one transaction never beats billing each leg at its own bracket");
         le(paid, gross * finalRate / PPM, "never more than the final bracket on all proceeds");
         eq(TREASURY.balance - treasuryBefore, paid, "treasury");
         _assertNoRawCustody();
+    }
+
+    /// @dev Every exact-input leg: non-negative ETH delta, input settled as requested, fee equal to
+    /// the documented cumulative bill and never above 2% of the leg's own output.
+    function _checkExactInputLegs(uint256[3] memory sizes, int256[] memory m, int256[] memory h, uint256 reserve)
+        internal
+        view
+        returns (uint256 gross, uint256 paid, uint256 perLeg)
+    {
+        Bill memory bill;
+        for (uint256 i; i < 3; ++i) {
+            ok(V4.amount0(h[i]) >= 0, "a sell leg never ends with a negative ETH delta");
+            eq(V4.amount1(h[i]), V4.amount1(m[i]), "token input settled as requested");
+            uint256 g = uint256(V4.amount0(m[i]));
+            uint256 legFee = g - uint256(V4.amount0(h[i]));
+            (uint256 modelled,) = _modelLeg(bill, sizes[i], g, true, reserve);
+            eq(legFee, modelled, "leg billed exactly as the documented cumulative bill with the per-leg cap");
+            le(legFee, g * 20_000 / PPM, "a leg never pays more than 2% of its own output");
+            gross += g;
+            paid += legFee;
+            perLeg += g * hook.feeRate(sizes[i], reserve) / PPM;
+        }
     }
 
     // ----- reserve snapshot -----
@@ -1148,10 +1298,13 @@ contract IMDOHookTest is IMDOFixture {
         eq(hook.accruedETH(), fee, "accrued as a claim");
         eq(manager.balanceOf(address(hook), 0), fee, "ERC-6909 claim backs it");
         _assertNoRawCustody();
-        // Harvest cannot deliver while the treasury rejects, and nothing is lost.
-        vm.expectRevert();
+        // Harvest cannot deliver while the treasury rejects: it does not revert, the ETH leg is
+        // skipped, and nothing is lost.
+        vm.prank(carol, carol);
         hook.harvest();
         eq(hook.accruedETH(), fee, "claim intact");
+        eq(manager.balanceOf(address(hook), 0), fee, "ERC-6909 claim intact");
+        eq(TREASURY.balance, 0, "nothing delivered");
         // Once the treasury accepts ETH anyone can harvest; ETH goes only to the treasury.
         vm.etch(TREASURY, "");
         uint256 carolBefore = carol.balance;
@@ -1172,6 +1325,46 @@ contract IMDOHookTest is IMDOFixture {
         uint256 fee = uint256(V4.amount0(m)) - uint256(V4.amount0(h));
         eq(fee, uint256(V4.amount0(m)) * 20_000 / PPM, "fee charged");
         eq(hook.accruedETH(), fee, "accrued instead of paid");
+        _assertNoRawCustody();
+    }
+
+    function test_harvestBurnsTheTokenClaimEvenWhileTheTreasuryRejectsEth() public {
+        vm.etch(TREASURY, REJECT_ETH);
+        uint256 reserve = hook.reserveSnapshot();
+        // An exact-input 5% sell leaves an ETH claim; an exact-output sell leaves a token claim.
+        int256 m = _swap(bob, mirror, false, -int256(_ceilPct(reserve, 500)), 0);
+        int256 h = _swap(alice, key, false, -int256(_ceilPct(reserve, 500)), 0);
+        uint256 ethFee = uint256(V4.amount0(m)) - uint256(V4.amount0(h));
+        eq(hook.accruedETH(), ethFee, "ETH claim");
+        m = _swap(bob, mirror, false, int256(reserve / 50), 0);
+        h = _swap(alice, key, false, int256(reserve / 50), 0);
+        uint256 tokenFee = uint256(-V4.amount1(h)) - uint256(-V4.amount1(m));
+        gt(tokenFee, 0, "token fee charged");
+        eq(hook.accruedToken(), tokenFee, "token claim");
+        uint256 supply = token.totalSupply();
+        uint256 managerTokens = token.balanceOf(address(manager));
+        // The two legs are independent: the token claim is burned now, the ETH claim stays.
+        vm.prank(carol, carol);
+        hook.harvest();
+        eq(hook.accruedToken(), 0, "token claim redeemed");
+        eq(token.totalSupply(), supply - tokenFee, "token fee burned");
+        eq(token.balanceOf(address(manager)), managerTokens - tokenFee, "burned out of the manager");
+        eq(hook.accruedETH(), ethFee, "ETH claim still recorded");
+        eq(manager.balanceOf(address(hook), 0), ethFee, "ETH claim still backed");
+        eq(TREASURY.balance, 0, "treasury still rejects");
+        eq(carol.balance, 1e24, "harvester gets nothing");
+        _assertNoRawCustody();
+        // Trading goes on meanwhile, and a later harvest pays the treasury once it accepts ETH.
+        m = _swap(bob, mirror, false, -int256(_ceilPct(reserve, 100)), 0);
+        h = _swap(alice, key, false, -int256(_ceilPct(reserve, 100)), 0);
+        uint256 fee = uint256(V4.amount0(m)) - uint256(V4.amount0(h));
+        eq(fee, uint256(V4.amount0(m)) * 5_000 / PPM, "sells continue while a claim is outstanding");
+        eq(hook.accruedETH(), ethFee + fee, "the new fee joins the outstanding claim");
+        vm.etch(TREASURY, "");
+        vm.prank(carol, carol);
+        hook.harvest();
+        eq(TREASURY.balance, ethFee + fee, "every ETH fee reached the treasury");
+        eq(hook.accruedETH() + hook.accruedToken(), 0, "nothing left to redeem");
         _assertNoRawCustody();
     }
 
@@ -1825,9 +2018,13 @@ contract IMDOHandler is Asserts {
         calls++;
     }
 
+    /// @dev Never guarded: harvest must not revert whatever the treasury does, and a rejecting
+    /// treasury must leave the ETH claim in place while the token claim is still burned.
     function harvest() external {
-        if (treasuryRejects && hook.accruedETH() != 0 && address(manager).balance >= hook.accruedETH()) return;
+        uint256 ethClaim = hook.accruedETH();
         hook.harvest();
+        if (treasuryRejects) eq(hook.accruedETH(), ethClaim, "a rejecting treasury leaves the ETH claim intact");
+        eq(hook.accruedToken(), 0, "harvest burns every token claim");
         calls++;
     }
 
